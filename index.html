@@ -405,8 +405,15 @@
   function fmtDistance(km) { return km < 1 ? `${Math.round(km*1000)} 米` : `${km.toFixed(1)} 公里`; }
   function etaInfo(value) {
     if (!value) return { text: '未有預報', clock: '—', soon: false };
-    const d = new Date(value), min = Math.max(0, Math.round((d - Date.now()) / 60000));
+    const d = new Date(value), min = Math.max(0, Math.floor((d - Date.now()) / 60000));
     return { text: min <= 0 ? '即將到站' : `${min} 分鐘`, clock: d.toLocaleTimeString('zh-HK',{hour:'2-digit',minute:'2-digit',hour12:false}), soon: min <= 5 };
+  }
+  function refreshEtaCountdowns() {
+    document.querySelectorAll('[data-eta-time]').forEach(el=>{
+      const info=etaInfo(el.dataset.etaTime), value=el.querySelector('strong') || el;
+      value.textContent=info.text;
+      if(el.classList.contains('eta')) el.classList.toggle('soon',info.soon);
+    });
   }
   function companyName(co) { return co === 'CTB' ? '城巴' : co === 'LWB' ? '龍運' : '九巴'; }
   function etaClock(time) { return new Date(time).toLocaleTimeString('zh-HK',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}); }
@@ -553,7 +560,7 @@
         const json=await getJSON(url,12000);
         if(token!==state.refreshGeneration || !card.isConnected) return;
         const predictions=[...new Map((json.data||[]).filter(x=>x.route===route&&(!x.dir||x.dir===dir)&&(!x.service_type||String(x.service_type)===String(service))&&x.eta&&new Date(x.eta).getTime()>=Date.now()-120000).map(x=>[x.eta,x])).values()].sort((a,b)=>new Date(a.eta)-new Date(b.eta)).slice(0,3);
-        card.querySelector('.etas').innerHTML=predictions.length?predictions.map(x=>{const e=etaInfo(x.eta);return `<div class="eta ${e.soon?'soon':''}"><strong>${esc(e.text)}</strong><span>${e.clock}${(x.rmk_tc||x.rmk)?' · '+esc(x.rmk_tc||x.rmk):''}</span></div>`;}).join(''):'<div class="eta"><strong>未有預報</strong><span>路線仍停靠此站</span></div>';
+        card.querySelector('.etas').innerHTML=predictions.length?predictions.map(x=>{const e=etaInfo(x.eta);return `<div class="eta ${e.soon?'soon':''}" data-eta-time="${esc(x.eta)}"><strong>${esc(e.text)}</strong><span>${e.clock}${(x.rmk_tc||x.rmk)?' · '+esc(x.rmk_tc||x.rmk):''}</span></div>`;}).join(''):'<div class="eta"><strong>未有預報</strong><span>路線仍停靠此站</span></div>';
       } catch(err) {
         console.warn('常用站點 ETA 暫時無法讀取',err);
         if(token===state.refreshGeneration && card.isConnected) card.querySelector('.etas').innerHTML='<div class="eta"><strong>更新唔到</strong><span>稍後自動重試</span></div>';
@@ -662,7 +669,7 @@
       const predictions=[...new Map(group.filter(x=>x.eta).map(x=>[x.eta,x])).values()].sort((a,b)=>new Date(a.eta)-new Date(b.eta));
       return `<article class="card eta-card" data-co="${esc(co)}" data-route="${esc(first.route)}" data-dir="${esc(first.dir||'O')}" data-service="${esc(first.service_type||1)}" data-stop="${esc(first._stopId)}">
         <div class="route-head"><span class="route-pill ${co==='CTB'?'ctb':''}">${esc(first.route)}</span><div class="route-meta"><div class="destination">往 ${esc(dest)}</div><div class="sub">${companyName(first.co||co)} · 上車站牌：${esc(first._stopName)}</div></div></div>
-        <div class="etas">${predictions.length ? predictions.slice(0,3).map(x => { const e=etaInfo(x.eta); return `<div class="eta ${e.soon?'soon':''}"><strong>${esc(e.text)}</strong><span>${e.clock}${(x.rmk_tc||x.rmk)?' · '+esc(x.rmk_tc||x.rmk):''}</span></div>`; }).join('') : '<div class="eta"><strong>未有預報</strong><span>路線仍停靠此站</span></div>'}</div></article>`;
+        <div class="etas">${predictions.length ? predictions.slice(0,3).map(x => { const e=etaInfo(x.eta); return `<div class="eta ${e.soon?'soon':''}" data-eta-time="${esc(x.eta)}"><strong>${esc(e.text)}</strong><span>${e.clock}${(x.rmk_tc||x.rmk)?' · '+esc(x.rmk_tc||x.rmk):''}</span></div>`; }).join('') : '<div class="eta"><strong>未有預報</strong><span>路線仍停靠此站</span></div>'}</div></article>`;
     }).join('');
     content.innerHTML = `<button class="back" id="back">← 返回</button><div class="route-summary"><div class="summary-top"><div><b>${esc(baseStopName(stop.name_tc || stop.name_en))}</b><p>${companyName(co)} · 附近 ${groupStops.length} 個站牌 · 每條線列出實際上車站牌</p></div>${favoriteButton(favKey('stop',co,stop.stop))}</div></div><div class="detail-actions"><button id="detail-map">⌖ 睇地圖</button><button id="detail-refresh">⟳ 即時更新</button></div>
       ${failures ? `<div class="notice">${failures} 個站牌暫時讀唔到資料，以下路線可能未齊。</div>` : ''}
@@ -752,6 +759,7 @@
         for(const [index,time] of times.entries()) {
           const item=document.createElement('span');
           item.className=index===0?'eta-next':'eta-after';
+          item.dataset.etaTime=time;
           item.textContent=etaInfo(time).text;
           etaEl.append(item);
         }
@@ -809,10 +817,11 @@
     }
   }
   map.on('moveend',()=>{ renderVisibleStops(); if(state.lastView==='home'&&!state.selected) renderHome(); });
-  document.addEventListener('visibilitychange',()=>{ if(!document.hidden) refreshWhenVisible(); });
+  document.addEventListener('visibilitychange',()=>{ if(!document.hidden) { refreshEtaCountdowns(); refreshWhenVisible(); } });
   window.addEventListener('focus',()=>refreshWhenVisible());
   window.addEventListener('online',()=>refreshWhenVisible(true));
   window.addEventListener('pageshow',event=>{ if(event.persisted) refreshWhenVisible(true); });
+  setInterval(refreshEtaCountdowns,10000);
 
   $('#search').addEventListener('input', e => { if(state.selected) clearDetail(); state.query=e.target.value; clearTimeout(state.searchTimer); state.searchTimer=setTimeout(runSearch,180); });
   document.querySelectorAll('.nav-item').forEach(btn=>btn.onclick=()=>navigate(btn.dataset.view));
