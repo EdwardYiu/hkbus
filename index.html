@@ -205,6 +205,9 @@
     .row-eta { flex:0 0 auto; align-self:center; display:flex; flex-direction:column; align-items:flex-end; gap:2px; color:#b91e2d; font-size:14px; font-weight:800; white-space:nowrap; }
     .row-eta .eta-after { color:#687784; font-size:12px; font-weight:700; }
     .row-eta:empty { display:none; }
+    .stop-row>.stop-tools { flex:0 0 auto; display:flex; align-items:flex-end; flex-direction:column; gap:6px; }
+    .stop-tools .favorite-btn.compact { padding:5px 8px; width:38px; font-size:16px; line-height:1; }
+    .favorite-stop-card .etas { margin-top:10px; }
     .map-legend { background:rgba(255,255,255,.95); color:#384550; border-color:#e5e8ec; box-shadow:var(--shadow); }
     .leaflet-control-zoom a { background:white !important; color:#b51828 !important; border-color:#e3e6e9 !important; }
     .bus-marker div { background:#bd1e2d; }
@@ -298,7 +301,7 @@
     filter: 'all', query: '', stops: [], stopMap: new Map(), stopNameIndex: new Map(), routes: [],
     routeLayer: null, stopLayer: null, selected: null, lastView: 'home', userPos: null,
     ctbStopCache: new Map(), refreshTimer: null, refreshGeneration: 0,
-    etaInFlight: false, lastEtaRequestAt: 0, lastEtaSuccessAt: 0,
+    etaInFlight: false, favoriteEtaInFlight: false, lastEtaRequestAt: 0, lastEtaSuccessAt: 0,
     searchTimer: null, returnView: 'home',
     favorites: new Set(), mapFrom: 'home'
   };
@@ -310,17 +313,20 @@
   try { for(const s of JSON.parse(localStorage.getItem('hkbus-ctb-stops-v1') || '[]')) state.ctbStopCache.set(s.stop,s); } catch (_) {}
 
   function favKey(type, ...values) { return [type, ...values].join('|'); }
-  function favoriteButton(key) { return `<button class="favorite-btn" data-favorite="${esc(key)}" aria-label="${state.favorites.has(key)?'移除常用':'加入常用'}">${state.favorites.has(key)?'★ 已收藏':'☆ 加入常用'}</button>`; }
+  function favoriteButton(key, compact = false) {
+    const saved=state.favorites.has(key), label=saved?'移除常用':'加入常用';
+    return `<button class="favorite-btn${compact?' compact':''}" data-favorite="${esc(key)}" aria-label="${label}">${compact?(saved?'★':'☆'):(saved?'★ 已收藏':'☆ 加入常用')}</button>`;
+  }
   function bindFavoriteButtons() {
     document.querySelectorAll('[data-favorite]').forEach(btn => btn.onclick = e => {
       e.stopPropagation();
       const key=btn.dataset.favorite;
       if(state.favorites.has(key)) state.favorites.delete(key); else state.favorites.add(key);
       try { localStorage.setItem('hkbus-favorites-v1', JSON.stringify([...state.favorites])); } catch (_) {}
-      btn.textContent=state.favorites.has(key)?'★ 已收藏':'☆ 加入常用';
+      btn.textContent=btn.classList.contains('compact')?(state.favorites.has(key)?'★':'☆'):(state.favorites.has(key)?'★ 已收藏':'☆ 加入常用');
       btn.setAttribute('aria-label',state.favorites.has(key)?'移除常用':'加入常用');
       toast(state.favorites.has(key)?'已加入常用':'已從常用移除');
-      if(state.lastView==='favorites') renderFavorites();
+      if(state.lastView==='favorites' && !state.selected) renderFavorites();
     });
   }
   function setNav(view) { document.querySelectorAll('.nav-item').forEach(btn => btn.classList.toggle('active',btn.dataset.view===view)); }
@@ -414,7 +420,15 @@
     }, delay);
   }
   function refreshWhenVisible(force = false) {
-    if(document.hidden || !state.selected || state.etaInFlight) return;
+    if(document.hidden) return;
+    if(!state.selected && state.lastView==='favorites') {
+      if(state.favoriteEtaInFlight) return;
+      if(!force && state.refreshTimer && Date.now() - state.lastEtaRequestAt < 25000) return;
+      clearTimeout(state.refreshTimer); state.refreshTimer=null;
+      loadFavoriteStopEtas(state.refreshGeneration);
+      return;
+    }
+    if(!state.selected || state.etaInFlight) return;
     if(!force && state.refreshTimer && Date.now() - state.lastEtaRequestAt < 25000) return;
     clearTimeout(state.refreshTimer); state.refreshTimer=null;
     const selected=state.selected;
@@ -500,16 +514,56 @@
   }
   function renderFavorites() {
     state.lastView='favorites'; setNav('favorites');
+    state.favoriteEtaInFlight=false;
     setStatus(`${state.favorites.size} 個常用項目 · 儲存在此瀏覽器`);
-    const routeCards=[], stopCards=[];
+    const token=++state.refreshGeneration;
+    const routeCards=[], stopCards=[], routeStopCards=[];
     for(const key of state.favorites){
-      const [type,co,id,dir,service]=key.split('|');
+      const [type,co,id,dir,service,stopId]=key.split('|');
       if(type==='route') { const route=state.routes.find(r=>r.co===co&&r.route===id&&r.bound===dir&&String(r.service_type||1)===service); if(route) routeCards.push(routeSearchCard(route)); }
       if(type==='stop') { const stop=co==='CTB'?state.ctbStopCache.get(id):state.stopMap.get(id); if(stop) stopCards.push(stopCard(stop)); }
+      if(type==='route-stop') { const stop=co==='CTB'?state.ctbStopCache.get(stopId):state.stopMap.get(stopId); if(stop) routeStopCards.push(routeStopFavoriteCard(co,id,dir,service,stop)); }
     }
-    content.innerHTML=`<div class="section-title">我的常用</div>${routeCards.length?'<div class="section-title">路線</div>'+routeCards.join(''):''}${stopCards.length?'<div class="section-title">車站</div>'+stopCards.join(''):''}
-      ${!routeCards.length&&!stopCards.length?'<div class="empty"><span class="big">☆</span>未有常用路線或車站<br><small>打開路線或車站，按「加入常用」即可收藏。</small></div>':''}`;
+    content.innerHTML=`<div class="section-title">我的常用</div>${routeStopCards.length?'<div class="section-title">路線站點 · 3 班到站時間</div>'+routeStopCards.join(''):''}${routeCards.length?'<div class="section-title">路線</div>'+routeCards.join(''):''}${stopCards.length?'<div class="section-title">車站</div>'+stopCards.join(''):''}
+      ${!routeCards.length&&!stopCards.length&&!routeStopCards.length?'<div class="empty"><span class="big">☆</span>未有常用路線或車站<br><small>打開路線，在沿線站旁按星號即可收藏該路線站點。</small></div>':''}`;
     bindRouteCards(); bindStopCards();
+    bindFavoriteButtons();
+    document.querySelectorAll('.favorite-stop-card').forEach(el=>el.onclick=()=>showRoute(el.dataset.co,el.dataset.route,el.dataset.dir,el.dataset.service,el.dataset.stop));
+    if(routeStopCards.length) loadFavoriteStopEtas(token);
+  }
+  function routeStopFavoriteCard(co,route,dir,service,stop) {
+    const routeInfo=state.routes.find(r=>r.co===co&&r.route===route&&r.bound===dir&&String(r.service_type||1)===String(service)) || {};
+    const dest=routeInfo.dest_tc || routeInfo.dest_en || '目的地未提供';
+    const key=favKey('route-stop',co,route,dir,service,stop.stop);
+    return `<article class="card eta-card favorite-stop-card" data-co="${esc(co)}" data-route="${esc(route)}" data-dir="${esc(dir)}" data-service="${esc(service)}" data-stop="${esc(stop.stop)}">
+      <div class="route-head"><span class="route-pill ${co==='CTB'?'ctb':''}">${esc(route)}</span><div class="route-meta"><div class="destination">往 ${esc(dest)}</div><div class="sub">${companyName(co)} · ${esc(stop.name_tc||stop.name_en||stop.stop)}</div></div>${favoriteButton(key)}</div>
+      <div class="etas"><div class="eta"><strong>讀取中…</strong><span>更新到站時間</span></div></div></article>`;
+  }
+  async function loadFavoriteStopEtas(token) {
+    if(token!==state.refreshGeneration || state.lastView!=='favorites' || state.selected || state.favoriteEtaInFlight) return;
+    const cards=[...document.querySelectorAll('.favorite-stop-card')];
+    if(!cards.length) return;
+    clearTimeout(state.refreshTimer); state.refreshTimer=null;
+    state.favoriteEtaInFlight=true;
+    state.lastEtaRequestAt=Date.now();
+    await pool(cards,async card=>{
+      try {
+        const {co,route,dir,service,stop}=card.dataset;
+        const url=co==='CTB'?`${API.batch}/stop-eta/CTB/${encodeURIComponent(stop)}?lang=zh-hant`:`${API.kmb}/stop-eta/${encodeURIComponent(stop)}`;
+        const json=await getJSON(url,12000);
+        if(token!==state.refreshGeneration || !card.isConnected) return;
+        const predictions=[...new Map((json.data||[]).filter(x=>x.route===route&&(!x.dir||x.dir===dir)&&(!x.service_type||String(x.service_type)===String(service))&&x.eta&&new Date(x.eta).getTime()>=Date.now()-120000).map(x=>[x.eta,x])).values()].sort((a,b)=>new Date(a.eta)-new Date(b.eta)).slice(0,3);
+        card.querySelector('.etas').innerHTML=predictions.length?predictions.map(x=>{const e=etaInfo(x.eta);return `<div class="eta ${e.soon?'soon':''}"><strong>${esc(e.text)}</strong><span>${e.clock}${(x.rmk_tc||x.rmk)?' · '+esc(x.rmk_tc||x.rmk):''}</span></div>`;}).join(''):'<div class="eta"><strong>未有預報</strong><span>路線仍停靠此站</span></div>';
+      } catch(err) {
+        console.warn('常用站點 ETA 暫時無法讀取',err);
+        if(token===state.refreshGeneration && card.isConnected) card.querySelector('.etas').innerHTML='<div class="eta"><strong>更新唔到</strong><span>稍後自動重試</span></div>';
+      }
+    },6);
+    if(token!==state.refreshGeneration) return;
+    state.favoriteEtaInFlight=false;
+    state.lastEtaSuccessAt=Date.now();
+    setStatus(`${cards.length} 個常用路線站點 · 更新：${etaClock(state.lastEtaSuccessAt)}`);
+    state.refreshTimer=setTimeout(()=>loadFavoriteStopEtas(token),30000);
   }
   function navigate(view) {
     if(view==='map') return showMap();
@@ -657,7 +711,7 @@
       drawRoute(stops, co, selectedStop);
       const origin = routeInfo.orig_tc || stops[0]?.name_tc || '起點', dest = routeInfo.dest_tc || stops.at(-1)?.name_tc || '終點';
       content.innerHTML = `<button class="back" id="back">← 返回</button><div class="route-summary"><div class="summary-top"><div><b>${esc(route)}　${esc(origin)} → ${esc(dest)}</b><p>${companyName(co)} · ${dir==='I'?'回程':'去程'} · ${stops.length} 個站</p></div>${favoriteButton(favKey('route',co,route,dir,service))}</div></div><div class="detail-actions"><button id="swap-direction">⇄ 睇${dir==='I'?'去程':'回程'}</button><button id="detail-map">⌖ 睇路線地圖</button></div>
-        ${stops.map((s,i)=>`<div class="stop-row ${s.stop===selectedStop?'selected':''}" data-stop="${esc(s.stop)}" data-co="${esc(co)}" data-seq="${esc(s.seq)}"><i class="stop-dot"></i><div><b>${i+1}. ${esc(s.name_tc||s.name_en||s.stop)}</b><small>點按查看此站所有到站班次</small></div><span class="row-eta"></span></div>`).join('')}`;
+        ${stops.map((s,i)=>`<div class="stop-row ${s.stop===selectedStop?'selected':''}" data-stop="${esc(s.stop)}" data-co="${esc(co)}" data-seq="${esc(s.seq)}"><i class="stop-dot"></i><div><b>${i+1}. ${esc(s.name_tc||s.name_en||s.stop)}</b><small>點按查看此站所有到站班次</small></div><div class="stop-tools">${favoriteButton(favKey('route-stop',co,route,dir,service,s.stop),true)}<span class="row-eta"></span></div></div>`).join('')}`;
       $('#back').onclick = goBackFromDetail;
       $('#swap-direction').onclick=()=>showRoute(co,route,dir==='I'?'O':'I',service);
       $('#detail-map').onclick=showMap;
