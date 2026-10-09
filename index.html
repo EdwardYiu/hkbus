@@ -297,7 +297,9 @@
   const state = {
     filter: 'all', query: '', stops: [], stopMap: new Map(), stopNameIndex: new Map(), routes: [],
     routeLayer: null, stopLayer: null, selected: null, lastView: 'home', userPos: null,
-    ctbStopCache: new Map(), refreshTimer: null, searchTimer: null, returnView: 'home',
+    ctbStopCache: new Map(), refreshTimer: null, refreshGeneration: 0,
+    etaInFlight: false, lastEtaRequestAt: 0, lastEtaSuccessAt: 0,
+    searchTimer: null, returnView: 'home',
     favorites: new Set(), mapFrom: 'home'
   };
   const $ = s => document.querySelector(s);
@@ -322,7 +324,7 @@
     });
   }
   function setNav(view) { document.querySelectorAll('.nav-item').forEach(btn => btn.classList.toggle('active',btn.dataset.view===view)); }
-  function clearDetail() { clearTimeout(state.refreshTimer); state.selected=null; if(state.routeLayer){map.removeLayer(state.routeLayer);state.routeLayer=null;} renderVisibleStops(); }
+  function clearDetail() { clearTimeout(state.refreshTimer); state.refreshTimer=null; state.refreshGeneration++; state.etaInFlight=false; state.selected=null; if(state.routeLayer){map.removeLayer(state.routeLayer);state.routeLayer=null;} renderVisibleStops(); }
   function showMap() { state.mapFrom=state.lastView; document.body.classList.add('map-mode'); setNav('map'); setTimeout(()=>map.invalidateSize(),50); }
   function hideMap() { document.body.classList.remove('map-mode'); setNav(state.mapFrom==='favorites'?'favorites':state.mapFrom==='search'?'search':'home'); setTimeout(()=>map.invalidateSize(),50); }
   function goBackFromDetail() { clearDetail(); if(state.returnView==='favorites') renderFavorites(); else if(state.returnView==='search') runSearch(); else renderHome(); }
@@ -341,9 +343,9 @@
     const el = $('#toast'); el.textContent = message; el.classList.add('show');
     clearTimeout(el._timer); el._timer = setTimeout(() => el.classList.remove('show'), 2800);
   }
-  async function getJSON(url) {
+  async function getJSON(url, timeoutMs = 45000) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 45000);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const res = await fetch(url, { signal: controller.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -401,6 +403,24 @@
     return { text: min <= 0 ? '即將到站' : `${min} 分鐘`, clock: d.toLocaleTimeString('zh-HK',{hour:'2-digit',minute:'2-digit',hour12:false}), soon: min <= 5 };
   }
   function companyName(co) { return co === 'CTB' ? '城巴' : co === 'LWB' ? '龍運' : '九巴'; }
+  function etaClock(time) { return new Date(time).toLocaleTimeString('zh-HK',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}); }
+  function scheduleEtaRefresh(token, callback, startedAt, failed = false) {
+    if(token !== state.refreshGeneration) return;
+    clearTimeout(state.refreshTimer);
+    const delay = failed ? 15000 : Math.max(1000, 30000 - (Date.now() - startedAt));
+    state.refreshTimer = setTimeout(() => {
+      state.refreshTimer = null;
+      if(!document.hidden && token === state.refreshGeneration) callback();
+    }, delay);
+  }
+  function refreshWhenVisible(force = false) {
+    if(document.hidden || !state.selected || state.etaInFlight) return;
+    if(!force && state.refreshTimer && Date.now() - state.lastEtaRequestAt < 25000) return;
+    clearTimeout(state.refreshTimer); state.refreshTimer=null;
+    const selected=state.selected;
+    if(selected.type==='stop') openStop(selected.co,selected.stopId,selected.preserveRoute,true);
+    else if(selected.type==='route' && selected.ready && selected.co!=='CTB') loadRouteEta(selected.route,selected.dir,selected.service);
+  }
   function updateClock() { $('#clock').textContent = new Date().toLocaleTimeString('zh-HK',{hour:'2-digit',minute:'2-digit',hour12:false}); }
   setInterval(updateClock, 1000); updateClock();
 
@@ -529,10 +549,16 @@
     const stop = co === 'CTB' ? state.ctbStopCache.get(stopId) : state.stopMap.get(stopId);
     if (!stop) return toast('未能讀取車站資料');
     clearTimeout(state.refreshTimer);
+    state.refreshTimer=null;
+    const startedAt=Date.now(), token=++state.refreshGeneration;
+    state.lastEtaRequestAt=startedAt;
+    state.etaInFlight=true;
+    let failed=true;
     if (!refresh && !preserveRoute) state.returnView=state.lastView;
+    if (!refresh) state.lastEtaSuccessAt=0;
     const scrollTop=content.scrollTop;
     const groupStops=relatedStops(stop,co);
-    state.selected = { type:'stop', co, stopId };
+    state.selected = { type:'stop', co, stopId, preserveRoute };
     if (preserveRoute && state._routeArgs) state._routeArgs[4] = stopId;
     setStatus(`更新 ${baseStopName(stop.name_tc || stop.name_en)}附近 ${groupStops.length} 個站牌…`, true);
     if(!refresh) {
@@ -544,20 +570,30 @@
       const results = await pool(groupStops, async station => {
         const url = co === 'CTB' ? `${API.batch}/stop-eta/CTB/${encodeURIComponent(station.stop)}?lang=zh-hant` : `${API.kmb}/stop-eta/${encodeURIComponent(station.stop)}`;
         try {
-          const json=await getJSON(url);
+          const json=await getJSON(url,12000);
           return { rows:(json.data || []).map(row => ({...row,_stopId:station.stop,_stopName:station.name_tc || station.name_en})), error:false };
         } catch(err) { console.warn('站牌 ETA 暫時無法讀取',station.stop,err); return {rows:[],error:true}; }
       },6);
-      if(state.selected?.type!=='stop'||state.selected.stopId!==stopId||state.selected.co!==co) return;
+      if(token!==state.refreshGeneration || state.selected?.type!=='stop'||state.selected.stopId!==stopId||state.selected.co!==co) return;
+      const failures=results.filter(x=>x.error).length;
+      if(failures===groupStops.length) throw new Error('所有站牌 ETA 請求失敗');
       const rows=results.flatMap(x=>x.rows).filter(x=>x.route && (!x.eta || new Date(x.eta).getTime() >= Date.now()-120000))
         .sort((a,b) => (a.eta ? new Date(a.eta).getTime() : Infinity) - (b.eta ? new Date(b.eta).getTime() : Infinity));
-      renderEta(stop, co, rows, preserveRoute, groupStops, results.filter(x=>x.error).length);
+      renderEta(stop, co, rows, preserveRoute, groupStops, failures);
       if(refresh) content.scrollTop=scrollTop;
-      setStatus(`${groupStops.length - results.filter(x=>x.error).length}/${groupStops.length} 個站牌 · 更新：${new Date().toLocaleTimeString('zh-HK',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})}`);
-      state.refreshTimer = setTimeout(() => { if(state.selected?.type==='stop' && state.selected.stopId===stopId) openStop(co,stopId,preserveRoute,true); }, 30000);
+      state.lastEtaSuccessAt=Date.now();
+      failed=false;
+      setStatus(`${groupStops.length - failures}/${groupStops.length} 個站牌 · 更新：${etaClock(state.lastEtaSuccessAt)}`);
     } catch (err) {
-      console.error(err); setStatus('到站資料暫時無法讀取');
-      const empty=content.querySelector('.empty'); if(empty) empty.textContent = '暫時未能取得到站時間，請稍後再試。';
+      if(token!==state.refreshGeneration) return;
+      console.error(err);
+      setStatus(`暫時更新唔到，15 秒後重試${state.lastEtaSuccessAt ? ` · 上次更新 ${etaClock(state.lastEtaSuccessAt)}` : ''}`);
+      const empty=content.querySelector('.empty'); if(empty) empty.textContent = '暫時未能取得到站時間，系統會自動重試。';
+    } finally {
+      if(token===state.refreshGeneration && state.selected?.type==='stop' && state.selected.stopId===stopId) {
+        state.etaInFlight=false;
+        scheduleEtaRefresh(token,()=>openStop(co,stopId,preserveRoute,true),startedAt,failed);
+      }
     }
   }
   function renderEta(stop, co, rows, preserveRoute, groupStops, failures) {
@@ -601,8 +637,12 @@
   async function showRoute(co, route, dir='O', service='1', selectedStop='') {
     if(document.body.classList.contains('map-mode')) hideMap();
     clearTimeout(state.refreshTimer);
+    state.refreshTimer=null;
+    const viewToken=++state.refreshGeneration;
+    state.etaInFlight=false;
+    state.lastEtaSuccessAt=0;
     if(!state.selected) state.returnView=state.lastView;
-    state.selected = {type:'route',co,route,dir,service};
+    state.selected = {type:'route',co,route,dir,service,ready:false};
     state._routeArgs = [co,route,dir,service,selectedStop];
     setStatus(`載入 ${route} 路線及沿途站點…`, true);
     content.innerHTML = `<button class="back" id="back">← 返回</button><div class="empty"><i class="spinner" style="display:inline-block"></i><br><br>整理路線中…</div>`;
@@ -612,6 +652,7 @@
       const json = await getJSON(url);
       const records = (json.data || []).sort((a,b)=>+a.seq-+b.seq);
       const stops = co === 'CTB' ? await pool(records, async r => ({...await getCtbStop(r.stop), seq:r.seq}), 6) : records.map(r => ({...state.stopMap.get(r.stop), seq:r.seq})).filter(s=>s.stop);
+      if(viewToken!==state.refreshGeneration || state.selected?.type!=='route') return;
       const routeInfo = state.routes.find(r=>r.co===co&&r.route===route&&r.bound===dir) || {};
       drawRoute(stops, co, selectedStop);
       const origin = routeInfo.orig_tc || stops[0]?.name_tc || '起點', dest = routeInfo.dest_tc || stops.at(-1)?.name_tc || '終點';
@@ -623,17 +664,25 @@
       bindFavoriteButtons();
       document.querySelectorAll('.stop-row').forEach(el => el.onclick = ()=>openStop(el.dataset.co,el.dataset.stop,true));
       setStatus(`${route} 沿途站點 · 到站預報每 30 秒更新`);
+      state.selected.ready=true;
       if(co!=='CTB') loadRouteEta(route,dir,service);
     } catch (err) {
+      if(viewToken!==state.refreshGeneration) return;
       console.error(err); setStatus('未能載入路線');
       content.innerHTML = `<button class="back" id="back">← 返回</button><div class="notice">這個方向可能沒有服務，或官方資料暫時無法讀取。請嘗試另一個方向。</div>`;
       $('#back').onclick=goBackFromDetail;
     }
   }
   async function loadRouteEta(route,dir,service) {
+    clearTimeout(state.refreshTimer);
+    state.refreshTimer=null;
+    const startedAt=Date.now(), token=++state.refreshGeneration;
+    state.lastEtaRequestAt=startedAt;
+    state.etaInFlight=true;
+    let failed=true;
     try {
-      const json=await getJSON(`${API.kmb}/route-eta/${encodeURIComponent(route)}/${encodeURIComponent(service)}`);
-      if(state.selected?.type!=='route'||state.selected.route!==route||state.selected.dir!==dir) return;
+      const json=await getJSON(`${API.kmb}/route-eta/${encodeURIComponent(route)}/${encodeURIComponent(service)}`,12000);
+      if(token!==state.refreshGeneration || state.selected?.type!=='route'||state.selected.route!==route||state.selected.dir!==dir||state.selected.service!==service) return;
       const etas=new Map();
       for(const row of json.data||[]) {
         if(row.dir!==dir||!row.eta||new Date(row.eta).getTime()<Date.now()-120000) continue;
@@ -653,11 +702,19 @@
           etaEl.append(item);
         }
       });
-      clearTimeout(state.refreshTimer);
-      state.refreshTimer=setTimeout(()=>{
-        if(state.selected?.type==='route'&&state.selected.route===route&&state.selected.dir===dir) loadRouteEta(route,dir,service);
-      },30000);
-    } catch(err) { console.warn('路線 ETA 暫時無法更新',err); }
+      state.lastEtaSuccessAt=Date.now();
+      failed=false;
+      setStatus(`${route} 沿途站點 · ETA 更新：${etaClock(state.lastEtaSuccessAt)}`);
+    } catch(err) {
+      if(token!==state.refreshGeneration) return;
+      console.warn('路線 ETA 暫時無法更新',err);
+      setStatus(`路線 ETA 暫時更新唔到，15 秒後重試${state.lastEtaSuccessAt ? ` · 上次更新 ${etaClock(state.lastEtaSuccessAt)}` : ''}`);
+    } finally {
+      if(token===state.refreshGeneration && state.selected?.type==='route' && state.selected.route===route && state.selected.dir===dir && state.selected.service===service) {
+        state.etaInFlight=false;
+        scheduleEtaRefresh(token,()=>loadRouteEta(route,dir,service),startedAt,failed);
+      }
+    }
   }
   function drawRoute(stops, co, selectedStop='') {
     if (state.routeLayer) map.removeLayer(state.routeLayer);
@@ -698,6 +755,10 @@
     }
   }
   map.on('moveend',()=>{ renderVisibleStops(); if(state.lastView==='home'&&!state.selected) renderHome(); });
+  document.addEventListener('visibilitychange',()=>{ if(!document.hidden) refreshWhenVisible(); });
+  window.addEventListener('focus',()=>refreshWhenVisible());
+  window.addEventListener('online',()=>refreshWhenVisible(true));
+  window.addEventListener('pageshow',event=>{ if(event.persisted) refreshWhenVisible(true); });
 
   $('#search').addEventListener('input', e => { if(state.selected) clearDetail(); state.query=e.target.value; clearTimeout(state.searchTimer); state.searchTimer=setTimeout(runSearch,180); });
   document.querySelectorAll('.nav-item').forEach(btn=>btn.onclick=()=>navigate(btn.dataset.view));
