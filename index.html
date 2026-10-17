@@ -4,7 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#b91424">
+  <meta name="application-name" content="巴士到未">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="巴士到未">
   <title>巴士到未 · 香港巴士實時到站</title>
+  <link rel="manifest" href="./manifest.json">
+  <link rel="icon" type="image/png" sizes="32x32" href="./icons/favicon-32.png">
+  <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
   <link rel="preconnect" href="https://unpkg.com">
   <link rel="preconnect" href="https://tile.openstreetmap.org">
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
@@ -57,6 +64,9 @@
     .brand h1 span { color: var(--cyan); }
     .live { display: flex; align-items: center; gap: 7px; color: #c8d6e5; font-size: 12px; }
     .live i { width: 8px; height: 8px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 0 5px rgba(55,214,193,.12); }
+    .brand-actions { display:flex; align-items:center; gap:8px; }
+    .install-btn { border:1px solid rgba(255,255,255,.35); background:rgba(255,255,255,.14); color:white; border-radius:999px; padding:6px 10px; font-size:11px; font-weight:750; cursor:pointer; }
+    .install-btn[hidden] { display:none; }
     .tagline { margin: 5px 0 16px; color: var(--muted); font-size: 13px; }
     .search-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
     .search-wrap { position: relative; }
@@ -184,6 +194,7 @@
     .distance { color:#b8202e; font-weight:650; }
     .route-pill { background:#bd1e2d; border-radius:10px; min-width:62px; font-size:19px; }
     .route-pill.ctb { background:#f6a226; color:#311c00; }
+    .fare-tag { display:inline-flex; margin-left:5px; padding:2px 7px; border-radius:999px; background:#fff0f2; color:#b81426; font-size:11px; font-weight:800; vertical-align:1px; white-space:nowrap; }
     .destination { color:#24303b; }
     .eta { background:#fff7f8; border-color:#f9dfe2; min-width:91px; }
     .eta strong { color:#b81426; font-size:17px; }
@@ -207,6 +218,7 @@
     .row-eta:empty { display:none; }
     .stop-row>.stop-tools { flex:0 0 auto; display:flex; align-items:flex-end; flex-direction:column; gap:6px; }
     .stop-tools .favorite-btn.compact { padding:5px 8px; width:38px; font-size:16px; line-height:1; }
+    .section-fare { color:#b81426; font-size:11px; font-weight:800; white-space:nowrap; }
     .favorite-stop-card .etas { margin-top:10px; }
     .map-legend { background:rgba(255,255,255,.95); color:#384550; border-color:#e5e8ec; box-shadow:var(--shadow); }
     .leaflet-control-zoom a { background:white !important; color:#b51828 !important; border-color:#e3e6e9 !important; }
@@ -256,7 +268,7 @@
       <header>
         <div class="brand">
           <h1>巴士<span>到未</span></h1>
-          <div class="live"><i></i><span id="clock">實時資料</span></div>
+          <div class="brand-actions"><button id="install-app" class="install-btn" hidden>安裝 App</button><div class="live"><i></i><span id="clock">實時資料</span></div></div>
         </div>
         <p class="tagline">九巴／龍運／城巴 · 到站時間與沿途路線</p>
         <div class="search-row">
@@ -298,7 +310,7 @@
   };
   const HK = [22.3193, 114.1694];
   const state = {
-    filter: 'all', query: '', stops: [], stopMap: new Map(), stopNameIndex: new Map(), routes: [],
+    filter: 'all', query: '', stops: [], stopMap: new Map(), stopNameIndex: new Map(), routes: [], fares: [], sectionFares: [],
     routeLayer: null, stopLayer: null, selected: null, lastView: 'home', userPos: null,
     ctbStopCache: new Map(), refreshTimer: null, refreshGeneration: 0,
     etaInFlight: false, favoriteEtaInFlight: false, lastEtaRequestAt: 0, lastEtaSuccessAt: 0,
@@ -416,6 +428,36 @@
     });
   }
   function companyName(co) { return co === 'CTB' ? '城巴' : co === 'LWB' ? '龍運' : '九巴'; }
+  function placeKey(value) { return String(value||'').toUpperCase().replace(/[\s()（）,，.。·・—–\-\/]/g,''); }
+  function routeFare(route) {
+    if(!route?.route) return null;
+    const candidates=state.fares.filter(x=>x.co===route.co&&x.route===String(route.route).toUpperCase());
+    if(!candidates.length) return null;
+    const origin=placeKey(route.orig_tc||route.orig_en), destination=placeKey(route.dest_tc||route.dest_en);
+    const exact=candidates.find(x=>placeKey(x.orig)===origin&&placeKey(x.dest)===destination);
+    if(exact) return Number(exact.fare);
+    const values=[...new Set(candidates.map(x=>Number(x.fare)).filter(Number.isFinite))];
+    return values.length===1?values[0]:null;
+  }
+  function fareTag(route, fallback = false) {
+    const fare=routeFare(route);
+    return Number.isFinite(fare)?`<span class="fare-tag">全程 $${fare.toFixed(1)}</span>`:(fallback?'<span class="fare-tag">票價未提供</span>':'');
+  }
+  function sectionFareValue(route, dir, seq) {
+    if(!route?.route || seq==null) return null;
+    const candidates=state.sectionFares.filter(x=>x.co===route.co&&x.route===String(route.route).toUpperCase());
+    if(!candidates.length) return null;
+    const origin=placeKey(route.orig_tc||route.orig_en), destination=placeKey(route.dest_tc||route.dest_en);
+    let record=candidates.find(x=>placeKey(x.orig)===origin&&placeKey(x.dest)===destination), direction='1';
+    if(!record) { record=candidates.find(x=>placeKey(x.orig)===destination&&placeKey(x.dest)===origin); direction='2'; }
+    if(!record && candidates.length===1) { record=candidates[0]; direction=dir==='I'?'2':'1'; }
+    const fare=record?.directions?.[direction]?.[String(seq)];
+    return Number.isFinite(Number(fare))&&Number(fare)>0?Number(fare):null;
+  }
+  function sectionFareTag(route, dir, seq) {
+    const fare=sectionFareValue(route,dir,seq);
+    return Number.isFinite(fare)?`<span class="section-fare">由此站 $${fare.toFixed(1)}</span>`:'';
+  }
   function etaClock(time) { return new Date(time).toLocaleTimeString('zh-HK',{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}); }
   function scheduleEtaRefresh(token, callback, startedAt, failed = false) {
     if(token !== state.refreshGeneration) return;
@@ -447,15 +489,19 @@
 
   async function init() {
     try {
-      const [stopsResult, kmbRoutesResult, ctbRoutesResult] = await Promise.allSettled([
+      const [stopsResult, kmbRoutesResult, ctbRoutesResult, faresResult, sectionFaresResult] = await Promise.allSettled([
         cached('hkbus-kmb-stops-v1', `${API.kmb}/stop`),
         cached('hkbus-kmb-routes-v1', `${API.kmb}/route/`),
-        cached('hkbus-ctb-routes-v1', `${API.ctb}/route/ctb`)
+        cached('hkbus-ctb-routes-v1', `${API.ctb}/route/ctb`),
+        cached('hkbus-fares-v1', 'fares.json'),
+        cached('hkbus-section-fares-v1', 'section-fares.json')
       ]);
-      for (const result of [stopsResult,kmbRoutesResult,ctbRoutesResult]) if(result.status==='rejected') console.warn('官方資料暫時無法載入',result.reason);
+      for (const result of [stopsResult,kmbRoutesResult,ctbRoutesResult,faresResult,sectionFaresResult]) if(result.status==='rejected') console.warn('官方資料暫時無法載入',result.reason);
       const stopsJson=stopsResult.status==='fulfilled'?stopsResult.value:{data:[]};
       const kmbRoutesJson=kmbRoutesResult.status==='fulfilled'?kmbRoutesResult.value:{data:[]};
       const ctbRoutesJson=ctbRoutesResult.status==='fulfilled'?ctbRoutesResult.value:{data:[]};
+      const faresJson=faresResult.status==='fulfilled'?faresResult.value:{data:[]};
+      const sectionFaresJson=sectionFaresResult.status==='fulfilled'?sectionFaresResult.value:{data:[]};
       if(stopsResult.status==='rejected'&&kmbRoutesResult.status==='rejected'&&ctbRoutesResult.status==='rejected') throw new Error('所有官方資料源均無法連接');
       state.stops = (stopsJson.data || []).map(s => ({ ...s, co:'KMB', lat:+s.lat, lng:+s.long })).filter(s => Number.isFinite(s.lat+s.lng));
       state.stopMap = new Map(state.stops.map(s => [s.stop, s]));
@@ -465,12 +511,24 @@
         if(!state.stopNameIndex.has(key)) state.stopNameIndex.set(key,[]);
         state.stopNameIndex.get(key).push(stop);
       }
-      const kRoutes = (kmbRoutesJson.data || []).map(r => ({...r, co: r.co || 'KMB'}));
+      const fareRecords=faresJson.data || [];
+      const fareOperators=new Map();
+      for(const fare of fareRecords) {
+        if(!fareOperators.has(fare.route)) fareOperators.set(fare.route,new Set());
+        fareOperators.get(fare.route).add(fare.co);
+      }
+      const kRoutes = (kmbRoutesJson.data || []).map(r => {
+        const operators=fareOperators.get(String(r.route).toUpperCase());
+        const inferred=operators?.has('LWB')&&!operators.has('KMB')?'LWB':'KMB';
+        return {...r,co:r.co||inferred};
+      });
       const cRoutes = (ctbRoutesJson.data || []).flatMap(r => [
         {...r, co:'CTB', bound:'O', service_type:'1'},
         {...r, co:'CTB', bound:'I', service_type:'1', orig_tc:r.dest_tc, orig_en:r.dest_en, dest_tc:r.orig_tc, dest_en:r.orig_en}
       ]);
       state.routes = [...kRoutes, ...cRoutes];
+      state.fares = fareRecords;
+      state.sectionFares = sectionFaresJson.data || [];
       setStatus(`已載入 ${state.stops.length.toLocaleString()} 個車站及 ${state.routes.length.toLocaleString()} 個路線方向${[stopsResult,kmbRoutesResult,ctbRoutesResult].some(r=>r.status==='rejected')?' · 部分資料暫缺':''}`);
       renderHome(); renderVisibleStops();
       if (location.protocol === 'file:') setTimeout(() => toast('提示：用 localhost 開啟可使用定位功能'), 900);
@@ -543,7 +601,7 @@
     const dest=routeInfo.dest_tc || routeInfo.dest_en || '目的地未提供';
     const key=favKey('route-stop',co,route,dir,service,stop.stop);
     return `<article class="card eta-card favorite-stop-card" data-co="${esc(co)}" data-route="${esc(route)}" data-dir="${esc(dir)}" data-service="${esc(service)}" data-stop="${esc(stop.stop)}">
-      <div class="route-head"><span class="route-pill ${co==='CTB'?'ctb':''}">${esc(route)}</span><div class="route-meta"><div class="destination">往 ${esc(dest)}</div><div class="sub">${companyName(co)} · ${esc(stop.name_tc||stop.name_en||stop.stop)}</div></div>${favoriteButton(key)}</div>
+      <div class="route-head"><span class="route-pill ${co==='CTB'?'ctb':''}">${esc(route)}</span><div class="route-meta"><div class="destination">往 ${esc(dest)} ${fareTag(routeInfo)}</div><div class="sub">${companyName(co)} · ${esc(stop.name_tc||stop.name_en||stop.stop)} <span class="section-fare-slot"></span></div></div>${favoriteButton(key)}</div>
       <div class="etas"><div class="eta"><strong>讀取中…</strong><span>更新到站時間</span></div></div></article>`;
   }
   async function loadFavoriteStopEtas(token) {
@@ -559,7 +617,10 @@
         const url=co==='CTB'?`${API.batch}/stop-eta/CTB/${encodeURIComponent(stop)}?lang=zh-hant`:`${API.kmb}/stop-eta/${encodeURIComponent(stop)}`;
         const json=await getJSON(url,12000);
         if(token!==state.refreshGeneration || !card.isConnected) return;
-        const predictions=[...new Map((json.data||[]).filter(x=>x.route===route&&(!x.dir||x.dir===dir)&&(!x.service_type||String(x.service_type)===String(service))&&x.eta&&new Date(x.eta).getTime()>=Date.now()-120000).map(x=>[x.eta,x])).values()].sort((a,b)=>new Date(a.eta)-new Date(b.eta)).slice(0,3);
+        const matchingRows=(json.data||[]).filter(x=>x.route===route&&(!x.dir||x.dir===dir)&&(!x.service_type||String(x.service_type)===String(service)));
+        const predictions=[...new Map(matchingRows.filter(x=>x.eta&&new Date(x.eta).getTime()>=Date.now()-120000).map(x=>[x.eta,x])).values()].sort((a,b)=>new Date(a.eta)-new Date(b.eta)).slice(0,3);
+        const routeInfo=state.routes.find(r=>r.co===co&&r.route===route&&r.bound===dir&&String(r.service_type||1)===String(service)) || {co,route};
+        card.querySelector('.section-fare-slot').innerHTML=sectionFareTag(routeInfo,dir,matchingRows[0]?.seq);
         card.querySelector('.etas').innerHTML=predictions.length?predictions.map(x=>{const e=etaInfo(x.eta);return `<div class="eta ${e.soon?'soon':''}" data-eta-time="${esc(x.eta)}"><strong>${esc(e.text)}</strong><span>${e.clock}${(x.rmk_tc||x.rmk)?' · '+esc(x.rmk_tc||x.rmk):''}</span></div>`;}).join(''):'<div class="eta"><strong>未有預報</strong><span>路線仍停靠此站</span></div>';
       } catch(err) {
         console.warn('常用站點 ETA 暫時無法讀取',err);
@@ -602,7 +663,7 @@
   function routeSearchCard(r) {
     const origin = r.orig_tc || r.orig_en || '—', dest = r.dest_tc || r.dest_en || '—';
     return `<article class="card route-card" data-co="${esc(r.co)}" data-route="${esc(r.route)}" data-dir="${esc(r.bound)}" data-service="${esc(r.service_type||1)}">
-      <div class="route-head"><span class="route-pill ${r.co==='CTB'?'ctb':''}">${esc(r.route)}</span><div class="route-meta"><div class="destination">${esc(origin)} → ${esc(dest)}</div><div class="sub">${companyName(r.co)} · ${r.bound==='I'?'回程／Inbound':'去程／Outbound'}</div></div></div></article>`;
+      <div class="route-head"><span class="route-pill ${r.co==='CTB'?'ctb':''}">${esc(r.route)}</span><div class="route-meta"><div class="destination">${esc(origin)} → ${esc(dest)}</div><div class="sub">${companyName(r.co)} · ${r.bound==='I'?'回程／Inbound':'去程／Outbound'} ${fareTag(r)}</div></div></div></article>`;
   }
 
   async function openStop(co, stopId, preserveRoute = false, refresh = false) {
@@ -666,9 +727,10 @@
     const html = [...groups.values()].map(group => {
       const first=group.find(x=>String(x.service_type||1)==='1') || group[0];
       const dest=first.dest || first.dest_tc || first.dest_en || '目的地未提供';
+      const routeInfo=state.routes.find(r=>r.co===(first.co||co)&&r.route===first.route&&r.bound===(first.dir||'O')&&String(r.service_type||1)===String(first.service_type||1)) || {co:first.co||co,route:first.route,dest_tc:dest};
       const predictions=[...new Map(group.filter(x=>x.eta).map(x=>[x.eta,x])).values()].sort((a,b)=>new Date(a.eta)-new Date(b.eta));
       return `<article class="card eta-card" data-co="${esc(co)}" data-route="${esc(first.route)}" data-dir="${esc(first.dir||'O')}" data-service="${esc(first.service_type||1)}" data-stop="${esc(first._stopId)}">
-        <div class="route-head"><span class="route-pill ${co==='CTB'?'ctb':''}">${esc(first.route)}</span><div class="route-meta"><div class="destination">往 ${esc(dest)}</div><div class="sub">${companyName(first.co||co)} · 上車站牌：${esc(first._stopName)}</div></div></div>
+        <div class="route-head"><span class="route-pill ${co==='CTB'?'ctb':''}">${esc(first.route)}</span><div class="route-meta"><div class="destination">往 ${esc(dest)} ${fareTag(routeInfo)}</div><div class="sub">${companyName(first.co||co)} · 上車站牌：${esc(first._stopName)} ${sectionFareTag(routeInfo,first.dir||'O',first.seq)}</div></div></div>
         <div class="etas">${predictions.length ? predictions.slice(0,3).map(x => { const e=etaInfo(x.eta); return `<div class="eta ${e.soon?'soon':''}" data-eta-time="${esc(x.eta)}"><strong>${esc(e.text)}</strong><span>${e.clock}${(x.rmk_tc||x.rmk)?' · '+esc(x.rmk_tc||x.rmk):''}</span></div>`; }).join('') : '<div class="eta"><strong>未有預報</strong><span>路線仍停靠此站</span></div>'}</div></article>`;
     }).join('');
     content.innerHTML = `<button class="back" id="back">← 返回</button><div class="route-summary"><div class="summary-top"><div><b>${esc(baseStopName(stop.name_tc || stop.name_en))}</b><p>${companyName(co)} · 附近 ${groupStops.length} 個站牌 · 每條線列出實際上車站牌</p></div>${favoriteButton(favKey('stop',co,stop.stop))}</div></div><div class="detail-actions"><button id="detail-map">⌖ 睇地圖</button><button id="detail-refresh">⟳ 即時更新</button></div>
@@ -714,11 +776,11 @@
       const records = (json.data || []).sort((a,b)=>+a.seq-+b.seq);
       const stops = co === 'CTB' ? await pool(records, async r => ({...await getCtbStop(r.stop), seq:r.seq}), 6) : records.map(r => ({...state.stopMap.get(r.stop), seq:r.seq})).filter(s=>s.stop);
       if(viewToken!==state.refreshGeneration || state.selected?.type!=='route') return;
-      const routeInfo = state.routes.find(r=>r.co===co&&r.route===route&&r.bound===dir) || {};
+      const routeInfo = state.routes.find(r=>r.co===co&&r.route===route&&r.bound===dir&&String(r.service_type||1)===String(service)) || state.routes.find(r=>r.co===co&&r.route===route&&r.bound===dir) || {co,route};
       drawRoute(stops, co, selectedStop);
       const origin = routeInfo.orig_tc || stops[0]?.name_tc || '起點', dest = routeInfo.dest_tc || stops.at(-1)?.name_tc || '終點';
-      content.innerHTML = `<button class="back" id="back">← 返回</button><div class="route-summary"><div class="summary-top"><div><b>${esc(route)}　${esc(origin)} → ${esc(dest)}</b><p>${companyName(co)} · ${dir==='I'?'回程':'去程'} · ${stops.length} 個站</p></div>${favoriteButton(favKey('route',co,route,dir,service))}</div></div><div class="detail-actions"><button id="swap-direction">⇄ 睇${dir==='I'?'去程':'回程'}</button><button id="detail-map">⌖ 睇路線地圖</button></div>
-        ${stops.map((s,i)=>`<div class="stop-row ${s.stop===selectedStop?'selected':''}" data-stop="${esc(s.stop)}" data-co="${esc(co)}" data-seq="${esc(s.seq)}"><i class="stop-dot"></i><div><b>${i+1}. ${esc(s.name_tc||s.name_en||s.stop)}</b><small>點按查看此站所有到站班次</small></div><div class="stop-tools">${favoriteButton(favKey('route-stop',co,route,dir,service,s.stop),true)}<span class="row-eta"></span></div></div>`).join('')}`;
+      content.innerHTML = `<button class="back" id="back">← 返回</button><div class="route-summary"><div class="summary-top"><div><b>${esc(route)}　${esc(origin)} → ${esc(dest)}</b><p>${companyName(co)} · ${dir==='I'?'回程':'去程'} · ${stops.length} 個站 · ${fareTag(routeInfo,true)}</p></div>${favoriteButton(favKey('route',co,route,dir,service))}</div></div><div class="detail-actions"><button id="swap-direction">⇄ 睇${dir==='I'?'去程':'回程'}</button><button id="detail-map">⌖ 睇路線地圖</button></div>
+        ${stops.map((s,i)=>`<div class="stop-row ${s.stop===selectedStop?'selected':''}" data-stop="${esc(s.stop)}" data-co="${esc(co)}" data-seq="${esc(s.seq)}"><i class="stop-dot"></i><div><b>${i+1}. ${esc(s.name_tc||s.name_en||s.stop)}</b><small>點按查看此站所有到站班次</small></div><div class="stop-tools">${favoriteButton(favKey('route-stop',co,route,dir,service,s.stop),true)}${sectionFareTag(routeInfo,dir,s.seq)}<span class="row-eta"></span></div></div>`).join('')}`;
       $('#back').onclick = goBackFromDetail;
       $('#swap-direction').onclick=()=>showRoute(co,route,dir==='I'?'O':'I',service);
       $('#detail-map').onclick=showMap;
@@ -840,6 +902,22 @@
     },err=>{ console.warn(err); setStatus('未能取得位置'); toast(location.protocol==='file:'?'請使用 localhost 開啟，瀏覽器才會容許定位':'請在瀏覽器允許位置權限'); },{enableHighAccuracy:true,timeout:10000});
   };
   window.addEventListener('unhandledrejection',e=>console.error(e.reason));
+  let deferredInstallPrompt=null;
+  const installButton=$('#install-app');
+  window.addEventListener('beforeinstallprompt',event=>{
+    event.preventDefault();
+    deferredInstallPrompt=event;
+    installButton.hidden=false;
+  });
+  installButton.onclick=async()=>{
+    if(!deferredInstallPrompt) return;
+    deferredInstallPrompt.prompt();
+    await deferredInstallPrompt.userChoice;
+    deferredInstallPrompt=null;
+    installButton.hidden=true;
+  };
+  window.addEventListener('appinstalled',()=>{ deferredInstallPrompt=null; installButton.hidden=true; toast('巴士到未已安裝'); });
+  if('serviceWorker' in navigator) window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').catch(err=>console.warn('Service worker 未能註冊',err)));
   init();
   </script>
 </body>
